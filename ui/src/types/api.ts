@@ -182,6 +182,7 @@ export interface PruneArtifactsResponse {
 
 export interface HubSettings {
   theme_preference: "dark" | "light" | "system";
+  timezone: string;
   subsystems: {
     ferrogate_enabled: boolean;
     ferrostate_enabled: boolean;
@@ -201,6 +202,7 @@ export interface HubSettings {
 
 export const DEFAULT_HUB_SETTINGS: HubSettings = {
   theme_preference: "dark",
+  timezone: "UTC",
   subsystems: {
     ferrogate_enabled: true,
     ferrostate_enabled: true,
@@ -298,6 +300,25 @@ export interface AgentRecord {
   covered_areas?: string[];
   updated_at?: string;
   by?: string;
+}
+
+export interface RecastAgentRequest {
+  project: string;
+  role: string;
+  extra_areas?: string[];
+  create_area?: boolean;
+  replace_lead?: boolean;
+  dry_run?: boolean;
+}
+
+export interface RecastAgentResponse {
+  agent?: AgentRecord;
+  before?: AgentRecord;
+  after?: AgentRecord;
+  retires_lead?: string | null;
+  creates_areas?: string[];
+  open_prs_tier_changes?: unknown[];
+  invalidated_review_markers?: unknown[];
 }
 
 export interface AreaRecord {
@@ -651,11 +672,16 @@ export interface PrCommitSummary {
   author_login?: string;
 }
 
+/** A pull request review, as the Hub reads it (`fl_core::pr_policy::PrReviewSummary`). */
 export interface PrReviewSummary {
-  reviewer_login: string;
+  id: number;
+  author_login: string;
+  /** The author's numeric GitHub user id; absent for a deleted account. The Hub counts an
+   * agent approval from the Reviewer App by this id, not by login. */
+  author_id?: number | null;
   state: string;
   body: string;
-  commit_id?: string;
+  commit_id?: string | null;
 }
 
 export interface PullRequestItem {
