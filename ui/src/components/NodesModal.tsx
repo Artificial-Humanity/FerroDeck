@@ -1,0 +1,963 @@
+import React, { useCallback, useEffect, useRef, useState } from "react";
+import { HubApiClient } from "../api/client";
+import type {
+  EnrolledNode,
+  FederatedTask,
+  NodeEnrollTokenResponse,
+  RuntimeMatrix,
+} from "../types/api";
+import { getAdapterBadgeClass } from "./RosterSidebar";
+
+export interface NodesModalProps {
+  isOpen: boolean;
+  onClose: () => void;
+  nodes?: EnrolledNode[];
+  onRefreshNodes?: () => Promise<void> | void;
+  onCreateEnrollToken?: (
+    label?: string,
+    ttlSecs?: number,
+  ) => Promise<NodeEnrollTokenResponse>;
+  onRevokeNode?: (nodeId: string) => Promise<void>;
+  apiClient?: HubApiClient;
+}
+
+export function formatRemainingTtl(remainingMs: number): string {
+  if (remainingMs <= 0) {
+    return "Expired";
+  }
+  const totalSecs = Math.ceil(remainingMs / 1000);
+  const mins = Math.floor(totalSecs / 60);
+  const secs = totalSecs % 60;
+  if (mins > 0) {
+    return `${mins}m ${secs}s`;
+  }
+  return `${secs}s`;
+}
+
+export type NodesModalTab = "nodes" | "federation";
+
+export function getEnvironmentBadgeStyle(kind: string): React.CSSProperties {
+  switch (kind) {
+    case "ai-lab":
+      return { borderColor: "var(--border-accent)", color: "var(--accent-hover)" };
+    case "macos-xcode":
+      return { borderColor: "rgba(96, 165, 250, 0.5)", color: "#93C5FD" };
+    case "cloud-worker":
+      return { borderColor: "rgba(167, 139, 250, 0.5)", color: "#C4B5FD" };
+    default:
+      return { borderColor: "var(--border-strong)", color: "var(--text-secondary)" };
+  }
+}
+
+export function getTaskStatusStyle(status: FederatedTask["status"]): React.CSSProperties {
+  switch (status) {
+    case "completed":
+      return { color: "#86EFAC", borderColor: "rgba(34, 197, 94, 0.45)" };
+    case "failed":
+      return { color: "#FCA5A5", borderColor: "rgba(239, 68, 68, 0.45)" };
+    case "running":
+      return { color: "#FCD34D", borderColor: "rgba(245, 158, 11, 0.45)" };
+    default:
+      return { color: "var(--text-secondary)" };
+  }
+}
+
+export function getNodeStatusDotClass(status: EnrolledNode["status"]): string {
+  if (status === "online") {
+    return "fd-dot fd-dot-alive";
+  }
+  if (status === "stale") {
+    return "fd-dot fd-dot-stale";
+  }
+  return "fd-dot fd-dot-dead";
+}
+
+export const NodesModal: React.FC<NodesModalProps> = ({
+  isOpen,
+  onClose,
+  nodes: propNodes,
+  onRefreshNodes,
+  onCreateEnrollToken,
+  onRevokeNode,
+  apiClient,
+}) => {
+  const [localNodes, setLocalNodes] = useState<EnrolledNode[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [labelInput, setLabelInput] = useState("");
+  const [enrolling, setEnrolling] = useState(false);
+  const [enrollToken, setEnrollToken] = useState<NodeEnrollTokenResponse | null>(null);
+  const [copied, setCopied] = useState(false);
+  const [copyFailed, setCopyFailed] = useState(false);
+  const [revokingId, setRevokingId] = useState<string | null>(null);
+  const [nowMs, setNowMs] = useState<number>(() => Date.now());
+  const [tab, setTab] = useState<NodesModalTab>("nodes");
+  const [matrix, setMatrix] = useState<RuntimeMatrix | null>(null);
+  const [matrixLoading, setMatrixLoading] = useState(false);
+  const [probing, setProbing] = useState(false);
+  const [matrixError, setMatrixError] = useState<string | null>(null);
+  const [taskDrafts, setTaskDrafts] = useState<Record<string, { command: string; project: string }>>({});
+  const [tasksByNode, setTasksByNode] = useState<Record<string, FederatedTask[]>>({});
+  const [dispatchingByNode, setDispatchingByNode] = useState<Record<string, boolean>>({});
+  const matrixReqIdRef = useRef(0);
+
+  const isControlled = propNodes !== undefined;
+  const effectiveNodes = isControlled ? propNodes : localNodes;
+
+  const refreshLocalNodes = useCallback(async () => {
+    if (!apiClient) return;
+    setLoading(true);
+    setError(null);
+    try {
+      const fetched = await apiClient.fetchNodes();
+      setLocalNodes(fetched);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to load nodes");
+    } finally {
+      setLoading(false);
+    }
+  }, [apiClient]);
+
+  useEffect(() => {
+    if (!isOpen) return;
+    if (!isControlled && apiClient) {
+      void refreshLocalNodes();
+    } else if (onRefreshNodes) {
+      void onRefreshNodes();
+    }
+  }, [isOpen, isControlled, apiClient, refreshLocalNodes, onRefreshNodes]);
+
+  const loadMatrix = useCallback(
+    async (probe: boolean) => {
+      const reqId = ++matrixReqIdRef.current;
+      const client = apiClient ?? new HubApiClient();
+      setMatrixError(null);
+      if (probe) setProbing(true);
+      else setMatrixLoading(true);
+      try {
+        const nextMatrix = probe ? await client.probeRuntimes() : await client.fetchRuntimeMatrix();
+        if (matrixReqIdRef.current === reqId) {
+          setMatrix(nextMatrix);
+        }
+      } catch (err) {
+        if (matrixReqIdRef.current === reqId) {
+          setMatrixError(err instanceof Error ? err.message : "Failed to probe runtimes");
+        }
+      } finally {
+        if (matrixReqIdRef.current === reqId) {
+          setProbing(false);
+          setMatrixLoading(false);
+        }
+      }
+    },
+    [apiClient],
+  );
+
+  useEffect(() => {
+    if (isOpen && tab === "federation" && matrix === null) {
+      void loadMatrix(false);
+    }
+  }, [isOpen, tab, matrix, loadMatrix]);
+
+  // Task queues load only when a client is injected; a bare modal makes no hidden requests.
+  const workerIds = (isControlled ? propNodes : localNodes)
+    .filter((n) => n.role === "worker" && n.status !== "revoked")
+    .map((n) => n.node_id)
+    .join("\n");
+  useEffect(() => {
+    if (!isOpen || !apiClient || workerIds === "") return;
+    let cancelled = false;
+    for (const nodeId of workerIds.split("\n")) {
+      apiClient
+        .fetchNodeTasks(nodeId)
+        .then((tasks) => {
+          if (!cancelled) setTasksByNode((prev) => ({ ...prev, [nodeId]: tasks }));
+        })
+        .catch(() => undefined);
+    }
+    return () => {
+      cancelled = true;
+    };
+  }, [isOpen, apiClient, workerIds]);
+
+  useEffect(() => {
+    if (!isOpen) {
+      matrixReqIdRef.current += 1;
+      setTab("nodes");
+      setError(null);
+      setMatrixError(null);
+      setProbing(false);
+      setMatrixLoading(false);
+    }
+  }, [isOpen]);
+
+  useEffect(() => {
+    if (!isOpen || !enrollToken) return;
+    setNowMs(Date.now());
+    const timer = setInterval(() => {
+      setNowMs(Date.now());
+    }, 1000);
+    return () => clearInterval(timer);
+  }, [isOpen, enrollToken]);
+
+  // The join command embeds a live enrollment credential. Forget it as soon
+  // as the modal closes so reopening later (or another operator at the same
+  // console) does not find a usable, possibly stale, secret on screen.
+  useEffect(() => {
+    if (!isOpen) {
+      setEnrollToken(null);
+      setCopied(false);
+      setCopyFailed(false);
+    }
+  }, [isOpen]);
+
+  useEffect(() => {
+    if (!isOpen) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        onClose();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [isOpen, onClose]);
+
+  if (!isOpen) {
+    return null;
+  }
+
+  const handleEnrollSubmit = async (e?: React.FormEvent) => {
+    e?.preventDefault();
+    setError(null);
+    setEnrolling(true);
+    setCopied(false);
+    setCopyFailed(false);
+    const trimmedLabel = labelInput.trim() || undefined;
+    try {
+      let tokenRes: NodeEnrollTokenResponse;
+      if (onCreateEnrollToken) {
+        tokenRes = await onCreateEnrollToken(trimmedLabel);
+      } else if (apiClient) {
+        tokenRes = await apiClient.createNodeEnrollToken(trimmedLabel);
+      } else {
+        const client = new HubApiClient();
+        tokenRes = await client.createNodeEnrollToken(trimmedLabel);
+      }
+      setEnrollToken(tokenRes);
+      setNowMs(Date.now());
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to generate enrollment token");
+    } finally {
+      setEnrolling(false);
+    }
+  };
+
+  const handleCopyCommand = async () => {
+    if (!enrollToken?.join_command) return;
+    try {
+      if (typeof navigator === "undefined" || !navigator.clipboard?.writeText) {
+        throw new Error("Clipboard API unavailable");
+      }
+      await navigator.clipboard.writeText(enrollToken.join_command);
+      setCopyFailed(false);
+      setCopied(true);
+    } catch {
+      // Never claim "Copied" when nothing reached the clipboard (insecure
+      // context, denied permission): the operator would paste a stale value.
+      setCopied(false);
+      setCopyFailed(true);
+    }
+  };
+
+  const handleDispatch = async (nodeId: string) => {
+    if (dispatchingByNode[nodeId]) return;
+    const draft = taskDrafts[nodeId];
+    const command = draft?.command.trim() ?? "";
+    if (!command) return;
+    setError(null);
+    setDispatchingByNode((prev) => ({ ...prev, [nodeId]: true }));
+    try {
+      const client = apiClient ?? new HubApiClient();
+      const task = await client.dispatchNodeTask(nodeId, {
+        kind: "shell",
+        command,
+        project: draft?.project.trim() || undefined,
+      });
+      setTasksByNode((prev) => ({ ...prev, [nodeId]: [task, ...(prev[nodeId] ?? [])] }));
+      setTaskDrafts((prev) => ({ ...prev, [nodeId]: { command: "", project: prev[nodeId]?.project ?? "" } }));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to dispatch task");
+    } finally {
+      setDispatchingByNode((prev) => {
+        const next = { ...prev };
+        delete next[nodeId];
+        return next;
+      });
+    }
+  };
+
+  const handleRevoke = async (nodeId: string) => {
+    setError(null);
+    setRevokingId(nodeId);
+    try {
+      if (onRevokeNode) {
+        await onRevokeNode(nodeId);
+      } else if (apiClient) {
+        await apiClient.revokeNode(nodeId);
+      } else {
+        const client = new HubApiClient();
+        await client.revokeNode(nodeId);
+      }
+      if (!isControlled) {
+        setLocalNodes((prev) => prev.filter((n) => n.node_id !== nodeId));
+        if (apiClient) {
+          await refreshLocalNodes();
+        }
+      } else if (onRefreshNodes) {
+        await onRefreshNodes();
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to revoke node");
+    } finally {
+      setRevokingId(null);
+    }
+  };
+
+  const remainingMs = enrollToken
+    ? Math.max(0, enrollToken.expires_at_ms - nowMs)
+    : 0;
+  const countdownText = enrollToken
+    ? remainingMs > 0
+      ? formatRemainingTtl(remainingMs)
+      : enrollToken.ttl_secs > 0
+        ? "Expired"
+        : "0s"
+    : "";
+
+  return (
+    <div
+      className="fd-modal-backdrop"
+      role="dialog"
+      aria-modal="true"
+      aria-label="Nodes & Enrollment"
+      data-testid="nodes-modal"
+    >
+      <div className="fd-modal" style={{ maxWidth: "680px", maxHeight: "88vh", display: "flex", flexDirection: "column" }}>
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            marginBottom: "14px",
+          }}
+        >
+          <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+            <h2 style={{ margin: 0, fontSize: "16px", fontWeight: 700 }}>
+              Nodes &amp; Enrollment
+            </h2>
+            <span className="fd-badge">
+              {effectiveNodes.filter((n) => n.status === "online").length} online / {effectiveNodes.length} total
+            </span>
+          </div>
+          <button
+            type="button"
+            className="fd-btn"
+            onClick={onClose}
+            aria-label="Close Nodes Modal"
+          >
+            ✕
+          </button>
+        </div>
+
+        {error && (
+          <div
+            role="alert"
+            style={{
+              marginBottom: "12px",
+              padding: "8px 10px",
+              borderRadius: "var(--radius-md)",
+              backgroundColor: "rgba(239, 68, 68, 0.14)",
+              border: "1px solid rgba(239, 68, 68, 0.45)",
+              color: "#FCA5A5",
+              fontSize: "12px",
+            }}
+          >
+            {error}
+          </div>
+        )}
+
+        <div role="tablist" aria-label="Nodes sections" style={{ display: "flex", gap: "6px", marginBottom: "12px" }}>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={tab === "nodes"}
+            className={tab === "nodes" ? "fd-btn fd-btn-primary" : "fd-btn"}
+            data-testid="nodes-tab-btn"
+            onClick={() => setTab("nodes")}
+          >
+            Nodes
+          </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={tab === "federation"}
+            className={tab === "federation" ? "fd-btn fd-btn-primary" : "fd-btn"}
+            data-testid="federation-tab-btn"
+            onClick={() => setTab("federation")}
+          >
+            Federation &amp; Runtime Matrix
+          </button>
+        </div>
+
+        {tab === "federation" && (
+          <FederationMatrixPanel
+            matrix={matrix}
+            loading={matrixLoading}
+            probing={probing}
+            error={matrixError}
+            onProbe={() => void loadMatrix(true)}
+          />
+        )}
+
+        {tab === "nodes" && (<>
+        <div
+          style={{
+            flex: 1,
+            overflowY: "auto",
+            display: "flex",
+            flexDirection: "column",
+            gap: "10px",
+            marginBottom: "16px",
+          }}
+        >
+          {loading && effectiveNodes.length === 0 ? (
+            <div style={{ padding: "16px", textAlign: "center", color: "var(--text-muted)", fontSize: "12px" }}>
+              Loading nodes...
+            </div>
+          ) : effectiveNodes.length === 0 ? (
+            <div
+              data-testid="nodes-empty-state"
+              style={{
+                padding: "18px 12px",
+                textAlign: "center",
+                color: "var(--text-muted)",
+                fontSize: "12px",
+                border: "1px dashed var(--border-subtle)",
+                borderRadius: "var(--radius-md)",
+              }}
+            >
+              No enrolled nodes reported yet. Use <strong>+ Enroll Node</strong> below to join a worker host.
+            </div>
+          ) : (
+            effectiveNodes.map((node) => {
+              const isHub = node.role === "hub";
+              const isWorker = node.role === "worker";
+              return (
+                <div
+                  key={node.node_id}
+                  className="fd-card"
+                  data-testid="enrolled-node-row"
+                  style={{
+                    display: "flex",
+                    flexDirection: "column",
+                    gap: "8px",
+                    padding: "10px 12px",
+                  }}
+                >
+                  <div
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "space-between",
+                      gap: "8px",
+                      flexWrap: "wrap",
+                    }}
+                  >
+                    <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
+                      <span
+                        className={getNodeStatusDotClass(node.status)}
+                        title={`Status: ${node.status}`}
+                        data-testid={`node-status-dot-${node.node_id}`}
+                      />
+                      <span style={{ fontWeight: 700, fontSize: "13px" }}>
+                        {node.display_name || node.node_id}
+                      </span>
+                      {node.display_name && node.display_name !== node.node_id && (
+                        <span className="fd-mono" style={{ fontSize: "11px", color: "var(--text-muted)" }}>
+                          ({node.node_id})
+                        </span>
+                      )}
+                      <span
+                        className="fd-badge"
+                        style={
+                          isHub
+                            ? {
+                                borderColor: "var(--border-accent)",
+                                backgroundColor: "var(--accent-subtle)",
+                                color: "var(--accent-hover)",
+                              }
+                            : undefined
+                        }
+                      >
+                        {isHub ? "HUB" : "WORKER"}
+                      </span>
+                      <span className="fd-badge" style={{ textTransform: "uppercase" }}>
+                        {node.status}
+                      </span>
+                    </div>
+
+                    {isWorker && node.status !== "revoked" && (
+                      <button
+                        type="button"
+                        className="fd-btn fd-btn-danger"
+                        data-testid="revoke-node-btn"
+                        disabled={revokingId === node.node_id}
+                        onClick={() => void handleRevoke(node.node_id)}
+                      >
+                        {revokingId === node.node_id ? "Revoking..." : "Revoke"}
+                      </button>
+                    )}
+                  </div>
+
+                  <div
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      gap: "8px",
+                      flexWrap: "wrap",
+                      fontSize: "11px",
+                      color: "var(--text-secondary)",
+                    }}
+                  >
+                    <span className="fd-badge fd-mono">
+                      {node.os}/{node.arch}
+                    </span>
+                    {node.hostname && (
+                      <span className="fd-mono" style={{ color: "var(--text-muted)" }}>
+                        host: {node.hostname}
+                      </span>
+                    )}
+                    {node.listen_addr && (
+                      <span className="fd-badge fd-mono" title="Listen Address">
+                        {node.listen_addr}
+                      </span>
+                    )}
+                  </div>
+
+                  {(node.capabilities?.length > 0 || node.labels?.length > 0) && (
+                    <div style={{ display: "flex", alignItems: "center", gap: "6px", flexWrap: "wrap" }}>
+                      {(node.capabilities ?? []).map((cap) => (
+                        <span
+                          key={`cap-${cap}`}
+                          className={getAdapterBadgeClass(cap)}
+                        >
+                          {cap}
+                        </span>
+                      ))}
+                      {(node.labels ?? []).map((lbl) => (
+                        <span
+                          key={`lbl-${lbl}`}
+                          className="fd-badge"
+                          style={{
+                            borderColor: "var(--border-strong)",
+                            color: "var(--text-primary)",
+                          }}
+                        >
+                          #{lbl}
+                        </span>
+                      ))}
+                    </div>
+                  )}
+
+                  {(node.environment_kind || (node.federated_subsystems?.length ?? 0) > 0) && (
+                    <div style={{ display: "flex", alignItems: "center", gap: "6px", flexWrap: "wrap" }}>
+                      {node.environment_kind && (
+                        <span
+                          className="fd-badge"
+                          data-testid={`env-badge-${node.node_id}`}
+                          style={getEnvironmentBadgeStyle(node.environment_kind)}
+                        >
+                          {node.environment_kind}
+                        </span>
+                      )}
+                      {(node.federated_subsystems ?? []).map((sub) => (
+                        <span
+                          key={`sub-${sub}`}
+                          className="fd-badge fd-mono"
+                          data-testid={`subsystem-pill-${node.node_id}-${sub}`}
+                          style={{ borderRadius: "999px" }}
+                        >
+                          {sub}
+                        </span>
+                      ))}
+                      {typeof node.active_tasks === "number" && node.active_tasks > 0 && (
+                        <span className="fd-badge" title="Tasks the node reports running">
+                          {node.active_tasks} active
+                        </span>
+                      )}
+                      {typeof node.load_avg === "number" && (
+                        <span className="fd-badge fd-mono" title="Load average">
+                          load {node.load_avg.toFixed(2)}
+                        </span>
+                      )}
+                    </div>
+                  )}
+
+                  {isWorker && node.status !== "revoked" && (
+                    <div
+                      data-testid={`node-federation-${node.node_id}`}
+                      style={{ display: "flex", flexDirection: "column", gap: "6px" }}
+                    >
+                      <form
+                        onSubmit={(e) => {
+                          e.preventDefault();
+                          void handleDispatch(node.node_id);
+                        }}
+                        style={{ display: "flex", gap: "6px", alignItems: "center", flexWrap: "wrap" }}
+                      >
+                        <input
+                          type="text"
+                          className="fd-input fd-mono"
+                          data-testid={`dispatch-node-command-${node.node_id}`}
+                          aria-label={`Command to dispatch to ${node.node_id}`}
+                          placeholder="Command to run on this node"
+                          autoComplete="off"
+                          spellCheck={false}
+                          value={taskDrafts[node.node_id]?.command ?? ""}
+                          onChange={(e) =>
+                            setTaskDrafts((prev) => ({
+                              ...prev,
+                              [node.node_id]: {
+                                command: e.target.value,
+                                project: prev[node.node_id]?.project ?? "",
+                              },
+                            }))
+                          }
+                          style={{ flex: 1, minWidth: "160px" }}
+                        />
+                        <input
+                          type="text"
+                          className="fd-input fd-mono"
+                          data-testid={`dispatch-node-project-${node.node_id}`}
+                          aria-label={`Project for ${node.node_id}`}
+                          placeholder="project (optional)"
+                          autoComplete="off"
+                          spellCheck={false}
+                          value={taskDrafts[node.node_id]?.project ?? ""}
+                          onChange={(e) =>
+                            setTaskDrafts((prev) => ({
+                              ...prev,
+                              [node.node_id]: {
+                                command: prev[node.node_id]?.command ?? "",
+                                project: e.target.value,
+                              },
+                            }))
+                          }
+                          style={{ width: "130px" }}
+                        />
+                        <button
+                          type="submit"
+                          className="fd-btn fd-btn-primary"
+                          data-testid="dispatch-node-task-btn"
+                          disabled={
+                            Boolean(dispatchingByNode[node.node_id]) ||
+                            node.status === "offline" ||
+                            !(taskDrafts[node.node_id]?.command ?? "").trim()
+                          }
+                        >
+                          {dispatchingByNode[node.node_id] ? "Dispatching..." : "Dispatch Federated Task"}
+                        </button>
+                      </form>
+                      {(tasksByNode[node.node_id] ?? []).length > 0 && (
+                        <ul
+                          data-testid={`node-task-list-${node.node_id}`}
+                          style={{ listStyle: "none", margin: 0, padding: 0, display: "flex", flexDirection: "column", gap: "4px" }}
+                        >
+                          {(tasksByNode[node.node_id] ?? []).slice(0, 5).map((task) => (
+                            <li
+                              key={task.task_id}
+                              data-testid="node-task-row"
+                              style={{ display: "flex", gap: "8px", alignItems: "baseline", fontSize: "11px" }}
+                            >
+                              <span className="fd-badge" style={getTaskStatusStyle(task.status)}>
+                                {task.status}
+                              </span>
+                              <code className="fd-mono" style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={task.command}>
+                                {task.command}
+                              </code>
+                              {task.output && (
+                                <span className="fd-mono" style={{ color: "var(--text-muted)", maxWidth: "180px", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={task.output}>
+                                  {task.output}
+                                </span>
+                              )}
+                            </li>
+                          ))}
+                        </ul>
+                      )}
+                    </div>
+                  )}
+                </div>
+              );
+            })
+          )}
+        </div>
+
+        <div
+          style={{
+            borderTop: "1px solid var(--border-subtle)",
+            paddingTop: "14px",
+            display: "flex",
+            flexDirection: "column",
+            gap: "10px",
+          }}
+        >
+          <form
+            onSubmit={(e) => void handleEnrollSubmit(e)}
+            style={{ display: "flex", gap: "8px", alignItems: "center", flexWrap: "wrap" }}
+          >
+            <input
+              type="text"
+              name="fd-enroll-node-label"
+              autoComplete="off"
+              autoCorrect="off"
+              autoCapitalize="off"
+              spellCheck={false}
+              data-1p-ignore="true"
+              data-lpignore="true"
+              data-form-type="other"
+              data-testid="enroll-node-label-input"
+              className="fd-input fd-mono"
+              placeholder="Optional node label (e.g. macos-xcode, gpu-worker)"
+              value={labelInput}
+              onChange={(e) => setLabelInput(e.target.value)}
+              disabled={enrolling}
+              style={{ flex: 1, minWidth: "200px" }}
+            />
+            <button
+              type="submit"
+              className="fd-btn fd-btn-primary"
+              data-testid="enroll-node-btn"
+              disabled={enrolling}
+            >
+              {enrolling ? "Generating..." : "+ Enroll Node"}
+            </button>
+          </form>
+
+          {enrollToken && (
+            <div
+              className="fd-card"
+              style={{
+                backgroundColor: "var(--bg-elevated)",
+                borderColor: "var(--border-accent)",
+                display: "flex",
+                flexDirection: "column",
+                gap: "8px",
+              }}
+            >
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  gap: "8px",
+                  flexWrap: "wrap",
+                  fontSize: "11px",
+                }}
+              >
+                <span style={{ fontWeight: 600, color: "var(--text-secondary)" }}>
+                  One-Time Worker Join Command
+                </span>
+                <span className="fd-badge fd-mono" data-testid="enroll-token-expiry">
+                  Expires in {countdownText}
+                </span>
+              </div>
+
+              <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                <code
+                  data-testid="enroll-join-command"
+                  className="fd-mono"
+                  style={{
+                    flex: 1,
+                    padding: "8px 10px",
+                    borderRadius: "var(--radius-sm)",
+                    backgroundColor: "var(--bg-input)",
+                    border: "1px solid var(--border-subtle)",
+                    fontSize: "12px",
+                    overflowX: "auto",
+                    whiteSpace: "nowrap",
+                  }}
+                >
+                  {enrollToken.join_command}
+                </code>
+                <button
+                  type="button"
+                  className="fd-btn"
+                  data-testid="copy-join-command-btn"
+                  onClick={() => void handleCopyCommand()}
+                >
+                  {copied ? "Copied" : copyFailed ? "Copy failed — select the command manually" : "Copy"}
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
+        </>)}
+      </div>
+    </div>
+  );
+};
+
+interface FederationMatrixPanelProps {
+  matrix: RuntimeMatrix | null;
+  loading: boolean;
+  probing: boolean;
+  error: string | null;
+  onProbe: () => void;
+}
+
+function MatrixSection({
+  title,
+  testId,
+  children,
+}: {
+  title: string;
+  testId: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <section data-testid={testId} style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
+      <h3 style={{ margin: 0, fontSize: "12px", fontWeight: 700, color: "var(--text-secondary)" }}>
+        {title}
+      </h3>
+      {children}
+    </section>
+  );
+}
+
+function MatrixRow({
+  testId,
+  ok,
+  name,
+  detail,
+  tags,
+}: {
+  testId: string;
+  ok: boolean;
+  name: string;
+  detail: string;
+  tags?: string[];
+}) {
+  return (
+    <div
+      className="fd-card"
+      data-testid={testId}
+      data-ok={ok ? "true" : "false"}
+      style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap", padding: "6px 10px", fontSize: "12px" }}
+    >
+      <span className={ok ? "fd-dot fd-dot-alive" : "fd-dot fd-dot-dead"} aria-hidden="true" />
+      <span style={{ fontWeight: 600 }}>{name}</span>
+      <span className="fd-mono" style={{ color: "var(--text-muted)", fontSize: "11px" }}>
+        {detail}
+      </span>
+      {(tags ?? []).map((tag) => (
+        <span key={tag} className="fd-badge fd-mono">
+          {tag}
+        </span>
+      ))}
+    </div>
+  );
+}
+
+const FederationMatrixPanel: React.FC<FederationMatrixPanelProps> = ({
+  matrix,
+  loading,
+  probing,
+  error,
+  onProbe,
+}) => (
+  <div
+    data-testid="federation-matrix-panel"
+    style={{ flex: 1, overflowY: "auto", display: "flex", flexDirection: "column", gap: "12px" }}
+  >
+    <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "8px" }}>
+      <span style={{ fontSize: "12px", color: "var(--text-muted)" }}>
+        5-Provider &amp; Runtime Testing Matrix
+      </span>
+      <button
+        type="button"
+        className="fd-btn fd-btn-primary"
+        data-testid="probe-runtimes-btn"
+        disabled={probing}
+        onClick={onProbe}
+      >
+        {probing ? "Probing..." : "Probe Runtimes"}
+      </button>
+    </div>
+
+    {error && (
+      <div role="alert" data-testid="matrix-error" style={{ color: "#FCA5A5", fontSize: "12px" }}>
+        {error}
+      </div>
+    )}
+
+    {!matrix ? (
+      <div style={{ padding: "16px", textAlign: "center", color: "var(--text-muted)", fontSize: "12px" }}>
+        {loading ? "Loading runtime matrix..." : "No probe results yet."}
+      </div>
+    ) : (
+      <>
+        <MatrixSection title="CLI Runtimes" testId="matrix-cli-section">
+          {matrix.cli_runtimes.map((rt) => (
+            <MatrixRow
+              key={rt.name}
+              testId={`runtime-cli-${rt.name}`}
+              ok={rt.installed && !rt.error}
+              name={rt.name}
+              detail={
+                rt.installed
+                  ? (rt.version ?? rt.error ?? "installed")
+                  : "not installed"
+              }
+              tags={[`${rt.active_routes} routes`, `${rt.live_sessions} live`]}
+            />
+          ))}
+        </MatrixSection>
+
+        <MatrixSection title="Vault API Keys" testId="matrix-vault-section">
+          {matrix.vault_error && (
+            <div role="alert" style={{ color: "#FCA5A5", fontSize: "11px" }}>
+              Vault unavailable: {matrix.vault_error}
+            </div>
+          )}
+          {matrix.vault_providers.map((p) => (
+            <MatrixRow
+              key={p.provider}
+              testId={`runtime-vault-${p.provider}`}
+              ok={p.status === "ready"}
+              name={p.provider}
+              detail={p.secret_name}
+              tags={[p.status]}
+            />
+          ))}
+        </MatrixSection>
+
+        <MatrixSection title="Local Ollama & Lemonade" testId="matrix-local-section">
+          {matrix.local_engines.map((e) => (
+            <MatrixRow
+              key={e.name}
+              testId={`runtime-local-${e.name}`}
+              ok={e.reachable}
+              name={e.name}
+              detail={
+                e.reachable
+                  ? `${e.latency_ms ?? "?"} ms · ${e.models.length} model${e.models.length === 1 ? "" : "s"}`
+                  : (e.error ?? "unreachable")
+              }
+              tags={e.models.slice(0, 3)}
+            />
+          ))}
+        </MatrixSection>
+      </>
+    )}
+  </div>
+);

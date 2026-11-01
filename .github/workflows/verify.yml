@@ -1,0 +1,57 @@
+# The verification trio, run on every pull request and on every push to `main`.
+#
+# On a pull request this run GATES the merge: the `main` ruleset requires the
+# `test, clippy, fmt` check by name, so renaming the job below silently breaks
+# the gate. The push to `main` runs the trio again on the merged result.
+#
+# No third-party actions are used. `actions/checkout` is GitHub's own; every
+# other step is a command from the toolchain.
+name: verify
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: verify-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  trio:
+    name: test, clippy, fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Record the toolchain this run used
+        run: |
+          rustup component add clippy rustfmt
+          rustc --version
+          cargo --version
+          node --version
+          npm --version
+          git --version
+
+      - name: cargo fmt --all --check
+        run: cargo fmt --all --check
+
+      - name: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets --workspace -- -D warnings
+
+      - name: cargo test --workspace
+        run: cargo test --workspace
+
+      - name: FerroDeck UI npm ci, test, and build
+        working-directory: ui
+        run: |
+          npm ci
+          npm test
+          npm run build
