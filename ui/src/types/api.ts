@@ -405,9 +405,14 @@ export interface DiscoveredSessionSummary {
   cwd?: string | null;
   record_id?: string | null;
   transcript_path?: string | null;
-  context_usage?: SessionContextUsage | null;
-  execution_mode?: string | null;
   quota_usage?: SessionQuotaUsage | null;
+  /** Server-measured context window usage; present only when the runtime reports one. */
+  context_usage?: SessionContextUsage | null;
+  /**
+   * Effective execution (permission) mode: `auto`, `yolo`, `plan`, `default`, `accept-edits`,
+   * or a lower-cased vendor value. Absent when the runtime states none.
+   */
+  execution_mode?: string | null;
 }
 
 export type DiscoveredSession = DiscoveredSessionSummary;
@@ -1296,6 +1301,10 @@ export interface CliRuntimeStatus {
   active_routes: number;
   live_sessions: number;
   probe_ms: number;
+  /** Whether the hub can run this CLI's own update command. */
+  update_supported?: boolean;
+  /** The update command as shown to a person, such as `claude update`. */
+  update_command?: string | null;
 }
 
 export interface VaultProviderStatus {
@@ -1322,6 +1331,27 @@ export interface RuntimeMatrix {
   vault_providers: VaultProviderStatus[];
   local_engines: LocalEngineStatus[];
   vault_error: string | null;
+  /** Account allowance by adapter id (`claude`, `codex`, `grok`, `antigravity`, `muse`). */
+  vendor_quotas?: Record<string, SessionQuotaUsage>;
+}
+
+export type RuntimeUpdateStatus =
+  | "updated"
+  | "unchanged"
+  | "unknown_version"
+  | "failed"
+  | "unsupported"
+  | "not_installed"
+  | "timeout";
+
+/** Outcome of `POST /api/v1/runtimes/update` for one CLI runtime. */
+export interface RuntimeUpdateResult {
+  runtime: string;
+  ok: boolean;
+  version_before: string | null;
+  version_after: string | null;
+  status: RuntimeUpdateStatus;
+  output_tail: string;
 }
 
 export interface NodesResponse {
