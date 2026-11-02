@@ -1,8 +1,12 @@
 # FerroDeck
 
-**FerroDeck** is the unified multi-vendor agent cockpit Progressive Web App (PWA) and backing
+<p align="center">
+  <img src="docs/assets/ferrodeck-hero.jpg" alt="FerroDeck — AI-Lab-0 Agent Command Center" width="100%" />
+</p>
+
+**FerroDeck** ([ferroloop.ai/ferrodeck](https://ferroloop.ai/ferrodeck)) is the unified multi-vendor agent cockpit Progressive Web App (PWA) and backing
 HTTP/1.1 + RFC 6455 WebSocket daemon (`fl-hub`) for the [FerroLoop](https://github.com/Artificial-Humanity/FerroLoop)
-agentic orchestration platform.
+([ferroloop.ai](https://ferroloop.ai)) agentic orchestration platform.
 
 Designed for desktop (macOS / Linux) and touch-first tablets and phones (iPadOS / iOS), FerroDeck
 gives operators a single real-time command center to supervise, steer, inspect, and govern
