@@ -27,7 +27,13 @@ use crate::api::{
 };
 
 /// Roles `spin-up` accepts (the FerroDeck role list).
-pub const SPIN_UP_ROLES: [&str; 4] = ["lead", "assistant", "ui-developer", "lab-manager"];
+pub const SPIN_UP_ROLES: [&str; 5] = [
+    "lead",
+    "assistant",
+    "ui-developer",
+    "strategist",
+    "lab-manager",
+];
 /// Vendors `spin-up` accepts; the first segment of a hosted `session_id`.
 pub const SPIN_UP_VENDORS: [&str; 5] = ["claude", "antigravity", "codex", "grok", "muse"];
 /// Node a session lands on when the request names none.
@@ -405,7 +411,7 @@ fn capitalize(persona: &str) -> String {
     }
 }
 
-/// `AgentRole` for a spin-up role string; `ui-developer` is a custom role.
+/// `AgentRole` for a spin-up role string; `ui-developer` and `strategist` are custom roles.
 fn agent_role_from_label(label: &str) -> AgentRole {
     match label.trim().to_ascii_lowercase().as_str() {
         "lead" => AgentRole::Lead,
@@ -1261,6 +1267,11 @@ mod tests {
             agent_role_from_label("ui-developer"),
             AgentRole::Custom("ui-developer".into())
         );
+        assert_eq!(
+            agent_role_from_label("strategist"),
+            AgentRole::Custom("strategist".into())
+        );
+        assert!(prompt_for("Faye", "FerroLoop", "strategist").contains("as the strategist."));
         assert_eq!(agent_role_from_label("lab-manager"), AgentRole::LabManager);
     }
 
