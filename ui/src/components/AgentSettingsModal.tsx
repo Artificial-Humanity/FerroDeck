@@ -11,13 +11,25 @@ import {
   type RecastConflictState,
 } from "./SettingsModal";
 import {
-  formatQuotaResetCountdown,
-  formatQuotaWindowRemaining,
   formatTokenCount,
   getVendorModelOptions,
-  hasQuotaUsageData,
   type EstimatedContextUsage,
 } from "./ChatPane";
+
+const EXECUTION_MODE_LABELS: Readonly<Record<string, string>> = {
+  auto: "Auto",
+  yolo: "Yolo",
+  plan: "Plan",
+  default: "Default",
+  "accept-edits": "Accept edits",
+};
+
+/** Display label for the hub's normalized execution mode; a vendor value the hub passed through is shown as is. */
+export function formatExecutionMode(mode?: string | null): string {
+  const raw = (mode ?? "").trim();
+  if (!raw) return "Unknown";
+  return EXECUTION_MODE_LABELS[raw.toLowerCase()] ?? raw;
+}
 
 export const THINKING_LEVEL_OPTIONS = [
   { value: "low", label: "low (Fast)" },
@@ -41,7 +53,17 @@ export interface AgentSettingsModalProps {
   switchingModel?: boolean;
   onChangeModelAndThinking: (nextModel: string, nextThinkingLevel: string) => void;
   contextEstimate: EstimatedContextUsage;
+  /**
+   * Ignored. The quota summary moved out of this modal; callers that still pass it keep
+   * compiling until they drop the prop.
+   */
   quotaUsage?: SessionQuotaUsage | null;
+  /**
+   * Effective execution mode the hub reports for the session (`auto`, `yolo`, `plan`, `default`,
+   * `accept-edits`, or a vendor value). `null` means the hub reported none ("Unknown"). When the
+   * prop is omitted the modal reads the mode from `GET /api/v1/sessions` through `apiClient`.
+   */
+  executionMode?: string | null;
   turnCount?: number;
   canCompact: boolean;
   compacting: boolean;
@@ -71,7 +93,7 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
   switchingModel = false,
   onChangeModelAndThinking,
   contextEstimate,
-  quotaUsage = null,
+  executionMode,
   turnCount,
   canCompact,
   compacting,
@@ -103,6 +125,35 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
     setRecastStatusBanner(null);
     setRecastModalOpen(false);
   }, [isOpen, agentName, agentProject, agentRole]);
+  const [fetchedExecutionMode, setFetchedExecutionMode] = useState<string | null>(null);
+  useEffect(() => {
+    setFetchedExecutionMode(null);
+    if (
+      !isOpen ||
+      executionMode !== undefined ||
+      !apiClient ||
+      !sessionId ||
+      typeof apiClient.getSessions !== "function"
+    ) {
+      return;
+    }
+    let cancelled = false;
+    Promise.resolve()
+      .then(() => apiClient.getSessions())
+      .then((res) => {
+        if (cancelled) return;
+        const sessions = res?.sessions ?? [];
+        const wanted = agentName?.trim().toLowerCase();
+        const match =
+          sessions.find((s) => s.id === sessionId) ??
+          (wanted ? sessions.find((s) => s.persona?.trim().toLowerCase() === wanted) : undefined);
+        setFetchedExecutionMode(match?.execution_mode ?? null);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [isOpen, executionMode, apiClient, sessionId, agentName]);
   useEffect(() => {
     if (!isOpen) return;
     const handleKeyDown = (event: KeyboardEvent) => {
@@ -183,13 +234,10 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
     !THINKING_LEVEL_OPTIONS.some((opt) => opt.value === effectiveThinking)
       ? [{ value: effectiveThinking, label: effectiveThinking }, ...THINKING_LEVEL_OPTIONS]
       : THINKING_LEVEL_OPTIONS;
-  const showQuota = hasQuotaUsageData(quotaUsage);
-  const quotaExhausted = Boolean(
-    quotaUsage &&
-      ((quotaUsage.exhausted_reason && quotaUsage.exhausted_reason.trim().length > 0) ||
-        (quotaUsage.primary_window?.used_percent ?? 0) >= 100 ||
-        (quotaUsage.secondary_window?.used_percent ?? 0) >= 100),
-  );
+  const effectiveExecutionMode =
+    executionMode !== undefined ? executionMode : fetchedExecutionMode;
+  const executionModeKey = (effectiveExecutionMode ?? "").trim().toLowerCase();
+  const executionModeIsYolo = executionModeKey === "yolo";
 
   return (
     <div className="fd-modal-backdrop" onClick={onClose}>
@@ -228,7 +276,7 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
                 color: "var(--text-secondary)",
               }}
             >
-              Configure live model &amp; thinking level, inspect context &amp; quota telemetry, and
+              Configure live model &amp; thinking level, inspect context &amp; execution mode, and
               manage session lifecycle.
             </p>
           </div>
@@ -520,186 +568,63 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
             </div>
           </div>
 
-          {showQuota && quotaUsage && (
-            <div
-              data-testid="agent-settings-quota-summary"
+          <div
+            data-testid="agent-settings-execution-mode"
+            style={{
+              display: "flex",
+              flexDirection: "column",
+              gap: "6px",
+              paddingTop: "4px",
+              borderTop: "1px solid var(--border-subtle)",
+            }}
+          >
+            <span
               style={{
-                display: "flex",
-                flexDirection: "column",
-                gap: "6px",
-                paddingTop: "4px",
-                borderTop: "1px solid var(--border-subtle)",
+                fontSize: "11px",
+                fontWeight: 600,
+                textTransform: "uppercase",
+                color: "var(--text-muted)",
               }}
             >
-              <span
-                style={{
-                  fontSize: "11px",
-                  fontWeight: 600,
-                  textTransform: "uppercase",
-                  color: "var(--text-muted)",
-                }}
-              >
-                Vendor Account Quota
-              </span>
-              <div
-                data-testid="quota-usage-badge"
-                data-exhausted={quotaExhausted ? "true" : undefined}
-                className={`fd-badge fd-quota-badge${quotaExhausted ? " is-exhausted" : ""}`}
-                title={
-                  quotaUsage.exhausted_reason?.trim() ||
-                  "Vendor account usage allowance"
-                }
-                style={{
-                  display: "inline-flex",
-                  alignItems: "center",
-                  gap: "8px",
-                  padding: "4px 8px",
-                  flexWrap: "wrap",
-                  borderColor: quotaExhausted
-                    ? "var(--diff-del-border, rgba(239, 68, 68, 0.45))"
-                    : "var(--border-subtle)",
-                  backgroundColor: quotaExhausted
-                    ? "var(--diff-del-bg, rgba(239, 68, 68, 0.14))"
-                    : "var(--bg-surface)",
-                  color: quotaExhausted ? "var(--diff-del-text, #FCA5A5)" : "var(--text-secondary)",
-                }}
-              >
-                {quotaUsage.tier && quotaUsage.tier.trim().length > 0 && (
-                  <span
-                    data-testid="quota-tier-chip"
-                    style={{
-                      padding: "1px 5px",
-                      borderRadius: "3px",
-                      fontSize: "10px",
-                      fontWeight: 700,
-                      letterSpacing: "0.04em",
-                      backgroundColor: quotaExhausted
-                        ? "rgba(239, 68, 68, 0.2)"
-                        : "var(--accent-subtle)",
-                      color: quotaExhausted ? "var(--diff-del-text, #FCA5A5)" : "var(--accent-hover)",
-                      border: `1px solid ${
-                        quotaExhausted
-                          ? "rgba(239, 68, 68, 0.45)"
-                          : "var(--border-accent)"
-                      }`,
-                    }}
-                  >
-                    {quotaUsage.tier.trim().toUpperCase()}
-                  </span>
-                )}
-                {quotaUsage.primary_window && (() => {
-                  const win = quotaUsage.primary_window;
-                  const remaining = formatQuotaWindowRemaining(win);
-                  const resetLabel = formatQuotaResetCountdown(win.resets_at_ms);
-                  const barColor =
-                    win.used_percent >= 100 || remaining <= 10
-                      ? "var(--status-danger)"
-                      : remaining <= 25
-                        ? "var(--status-stale)"
-                        : "var(--status-alive)";
-                  return (
-                    <span
-                      data-testid="quota-primary-window"
-                      style={{ display: "inline-flex", alignItems: "center", gap: "5px", whiteSpace: "nowrap" }}
-                    >
-                      <span>5h: {remaining}% left</span>
-                      <span
-                        role="progressbar"
-                        aria-label="5h session allowance remaining"
-                        aria-valuemin={0}
-                        aria-valuemax={100}
-                        aria-valuenow={remaining}
-                        style={{
-                          width: "48px",
-                          height: "6px",
-                          borderRadius: "3px",
-                          backgroundColor: "var(--bg-input)",
-                          border: "1px solid var(--border-subtle)",
-                          overflow: "hidden",
-                          display: "inline-block",
-                        }}
-                      >
-                        <span
-                          style={{
-                            display: "block",
-                            width: `${remaining}%`,
-                            height: "100%",
-                            backgroundColor: barColor,
-                          }}
-                        />
-                      </span>
-                      {resetLabel && (
-                        <span style={{ color: "var(--text-dim)", fontSize: "10.5px" }}>
-                          ({resetLabel})
-                        </span>
-                      )}
-                    </span>
-                  );
-                })()}
-                {quotaUsage.secondary_window && (() => {
-                  const win = quotaUsage.secondary_window;
-                  const remaining = formatQuotaWindowRemaining(win);
-                  const resetLabel = formatQuotaResetCountdown(win.resets_at_ms);
-                  const barColor =
-                    win.used_percent >= 100 || remaining <= 10
-                      ? "var(--status-danger)"
-                      : remaining <= 25
-                        ? "var(--status-stale)"
-                        : "var(--status-alive)";
-                  return (
-                    <span
-                      data-testid="quota-secondary-window"
-                      style={{ display: "inline-flex", alignItems: "center", gap: "5px", whiteSpace: "nowrap" }}
-                    >
-                      <span>7d: {remaining}% left</span>
-                      <span
-                        role="progressbar"
-                        aria-label="Weekly allowance remaining"
-                        aria-valuemin={0}
-                        aria-valuemax={100}
-                        aria-valuenow={remaining}
-                        style={{
-                          width: "48px",
-                          height: "6px",
-                          borderRadius: "3px",
-                          backgroundColor: "var(--bg-input)",
-                          border: "1px solid var(--border-subtle)",
-                          overflow: "hidden",
-                          display: "inline-block",
-                        }}
-                      >
-                        <span
-                          style={{
-                            display: "block",
-                            width: `${remaining}%`,
-                            height: "100%",
-                            backgroundColor: barColor,
-                          }}
-                        />
-                      </span>
-                      {resetLabel && (
-                        <span style={{ color: "var(--text-dim)", fontSize: "10.5px" }}>
-                          ({resetLabel})
-                        </span>
-                      )}
-                    </span>
-                  );
-                })()}
-                {quotaExhausted && (
-                  <span
-                    data-testid="quota-exhausted-alert"
-                    style={{
-                      fontWeight: 600,
-                      color: "var(--diff-del-text, #FCA5A5)",
-                      whiteSpace: "nowrap",
-                    }}
-                  >
-                    {quotaUsage.exhausted_reason?.trim() || "Quota exhausted"}
-                  </span>
-                )}
-              </div>
-            </div>
-          )}
+              Execution Mode
+            </span>
+            <span
+              data-testid="execution-mode-badge"
+              data-mode={executionModeKey || "unknown"}
+              data-warning={executionModeIsYolo ? "true" : undefined}
+              className="fd-badge"
+              title={
+                executionModeIsYolo
+                  ? "Yolo: this session runs tools without asking for approval"
+                  : "Reported by the agent runtime"
+              }
+              style={{
+                alignSelf: "flex-start",
+                padding: "4px 8px",
+                fontWeight: 600,
+                borderColor: executionModeIsYolo
+                  ? "var(--status-stale, #F59E0B)"
+                  : "var(--border-subtle)",
+                backgroundColor: executionModeIsYolo
+                  ? "rgba(245, 158, 11, 0.14)"
+                  : "var(--bg-surface)",
+                color: executionModeIsYolo
+                  ? "var(--status-stale, #F59E0B)"
+                  : executionModeKey
+                    ? "var(--text-secondary)"
+                    : "var(--text-muted)",
+              }}
+            >
+              {formatExecutionMode(effectiveExecutionMode)}
+            </span>
+            <span
+              data-testid="execution-mode-note"
+              style={{ fontSize: "11px", color: "var(--text-muted)" }}
+            >
+              Read-only: how this session handles tool approvals. Change it in the agent&apos;s own
+              CLI.
+            </span>
+          </div>
         </div>
 
         {/* Session Lifecycle Actions */}
